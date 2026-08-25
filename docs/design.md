@@ -102,7 +102,8 @@ message TelemetryStats {
   double cpu_user_seconds_total = 5;   // cumulative, from getrusage()
   double cpu_system_seconds_total = 6; // cumulative, from getrusage()
   int64  max_rss_kb = 7;               // from getrusage()
-  double producer_microseconds_per_frame = 8; // most recent frame's capture->publish time
+  double producer_microseconds_per_frame = 8; // most recent frame's main-thread build+enqueue time
+                                               // (see design.md §5.2 for exact scope)
 }
 ```
 
@@ -158,8 +159,9 @@ telemetry.start();
 
 FrameBuffer buf(800 * 600 * 2);
 while (running) {
-  auto t0 = steady_clock::now();
   int64_t capture_ns = camera.readFrame(buf);              // (1) camera fills buf in place
+  auto t0 = steady_clock::now();                           // timing starts *after* the camera's
+                                                             // pacing wait — see §5.2
 
   auto pb_frame = std::make_unique<telemetry::ImageFrame>();
   pb_frame->set_capture_time_unix_ns(capture_ns);
@@ -241,8 +243,18 @@ class Telemetry {
   cheap syscall, negligible overhead relative to the 33ms frame budget.
 - **Producer microseconds/frame**: `t1 - t0` from the main-thread capture loop, handed to the
   telemetry object via `recordProducerFrameTime` and reported as the *most recent* value (not
-  averaged) in `producer_microseconds_per_frame`, since main-thread capture timing and the
-  telemetry thread's own publish cadence are different loops.
+  averaged) in `producer_microseconds_per_frame`. This is deliberately scoped to **main-thread
+  work only** — protobuf message construction (including the pixel-data copy) through `enqueue()`
+  returning. It explicitly excludes two things: the camera's `clock_nanosleep` pacing wait (`t0`
+  is taken *after* `readFrame()` returns, not before — see §5.1), and everything the telemetry
+  service thread does afterward (dequeue, serialize, `zmq_send()`), since that work happens
+  asynchronously on a different thread with its own cadence and there is no need to signal
+  anything back from that thread to the main thread to measure it. Full pipeline timing
+  visibility is still available, just assembled from data that already flows in one direction:
+  the telemetry object's own `time_in_queue` running stats (§3, `TelemetryStats.time_in_queue`)
+  cover queue dwell time, and the GUI's own latency computation (§6, `capture_time_unix_ns` vs.
+  receipt time) covers everything from capture through GUI display. No new field or backward
+  communication channel is introduced to fill this gap.
 
 ### 5.3 Endpoint configuration
 
@@ -315,19 +327,23 @@ v4l2-demo/
 │   │   ├── synthetic_v4l2_camera.h
 │   │   ├── telemetry.h
 │   │   └── bounded_drop_oldest_queue.h
-│   └── src/
-│       ├── main.cpp
-│       ├── synthetic_v4l2_camera.cpp
-│       └── telemetry.cpp
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── synthetic_v4l2_camera.cpp
+│   │   └── telemetry.cpp
+│   └── tests/                (GoogleTest sources, one file per class under test)
 └── gui/                       (Python, runs on Windows)
     ├── requirements.txt       (PyQt6, pyzmq, protobuf, numpy)
     ├── gui.py
-    └── zmq_receiver.py
+    ├── zmq_receiver.py
+    └── tests/                 (pytest sources, incl. fake_producer.py test fixture)
 ```
 
 `proto/telemetry.proto` is generated into both `producer/` (via CMake at configure/build time)
 and `gui/` (via a `protoc` step documented in `gui/README.md` or a small `make proto` helper) —
 neither generated output is checked in, to keep the `.proto` as the single source of truth.
+
+Test suites for both sides are covered in [test-plan.md](test-plan.md).
 
 ## 9. Known Limitations (carried from requirements §6)
 
@@ -335,6 +351,11 @@ neither generated output is checked in, to keep the `.proto` as the single sourc
   is implemented.
 - `memory_copies_per_frame` is a documented constant derived from code inspection, not a
   runtime-measured count.
+- Unlike `SyntheticV4L2Camera` (which never allocates per frame, §4), `main.cpp`'s capture loop
+  allocates one `ImageFrame` via `std::make_unique` every frame (§5.1). This is an accepted
+  simplification, not tracked by `memory_copies_per_frame` (which counts `memcpy`-style copies,
+  not allocations) or by any test — a pooled/reused-message approach was considered and rejected
+  as unnecessary complexity for a prototype.
 - No security/auth on ZMQ sockets; no reconnect/discovery logic beyond a manually-supplied IP.
 - ZMQ `PUB`/`SUB` has no message replay for a subscriber that connects after publishing has
   started (the "slow-joiner" problem) — a GUI that connects mid-run will not see frames

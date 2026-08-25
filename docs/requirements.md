@@ -95,7 +95,10 @@ The telemetry protobuf message (published on socket 2) must include, at minimum:
 - CPU usage of the producer service, via `getrusage()` (user+system CPU time), not manual
   `/proc` parsing.
 - Memory usage of the producer service (max RSS), via `getrusage()`.
-- Total microseconds per frame of producer execution time (capture through publish).
+- Microseconds per frame of producer main-thread processing time (protobuf message construction
+  through enqueue — see design.md §5.2 for exact scope and rationale; this is one component of
+  full pipeline timing, alongside the time-in-queue stats above and the GUI-computed end-to-end
+  latency from the image message's capture timestamp).
 
 The image protobuf message (published on socket 1) must include, at minimum:
 
@@ -183,3 +186,16 @@ The image protobuf message (published on socket 1) must include, at minimum:
 14. **Bounded queue size**: **1 second's worth of frames** (30 at the target 30 fps).
 15. **Telemetry publish rate**: **same rate as the camera feed (30 Hz)** — telemetry is live data
     about current latency/queue state and should update in lockstep with the image stream.
+16. **Telemetry wire format**: **protobuf message, not free text** — deviates from
+    human-requirements.md's literal wording ("a text string"), because §3.4's telemetry fields
+    (running stats, copy count, CPU/mem, per-frame timing) are structured numeric data the GUI
+    needs to parse and display live; a protobuf message is the same wire-format discipline
+    already used for the image stream, versus inventing a separate text parsing scheme for one
+    socket only.
+17. **`producer_microseconds_per_frame` scope**: main-thread work only (protobuf construction
+    through `enqueue()`), excluding the camera's pacing wait and the telemetry service thread's
+    work (serialize, send). Kept intentionally one-directional — no timing data is signaled back
+    from the telemetry thread to the main thread. Full pipeline visibility is assembled instead
+    from data that already flows forward: the telemetry object's own time-in-queue running stats,
+    plus the GUI's end-to-end latency computation from the image message's capture timestamp (see
+    design.md §5.2).
