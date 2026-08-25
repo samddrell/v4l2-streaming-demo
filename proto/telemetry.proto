@@ -1,0 +1,40 @@
+syntax = "proto3";
+package telemetry;
+
+enum PixelFormat {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+  PIXEL_FORMAT_YUY2 = 1; // packed YUV 4:2:2, V4L2 fourcc 'YUYV'
+}
+
+message ImageFrame {
+  int64  capture_time_unix_ns = 1;  // Jetson clock, time the frame was captured
+  uint32 width = 2;                 // 800
+  uint32 height = 3;                // 600
+  PixelFormat pixel_format = 4;     // PIXEL_FORMAT_YUY2
+  bytes pixel_data = 5;             // width*height*2 bytes for YUY2
+}
+
+message QueueStats {
+  uint32 current_depth = 1;
+  uint32 min_depth = 2;
+  uint32 max_depth = 3;
+  double mean_depth = 4;
+}
+
+message TimeInQueueStats {
+  double min_ms = 1;
+  double max_ms = 2;
+  double mean_ms = 3;
+}
+
+message TelemetryStats {
+  int64 sample_time_unix_ns = 1;
+  QueueStats queue_depth = 2;
+  TimeInQueueStats time_in_queue = 3;
+  uint32 memory_copies_per_frame = 4;
+  double cpu_user_seconds_total = 5;   // cumulative, from getrusage()
+  double cpu_system_seconds_total = 6; // cumulative, from getrusage()
+  int64  max_rss_kb = 7;               // from getrusage()
+  double producer_microseconds_per_frame = 8; // most recent frame's main-thread build+enqueue time
+                                               // (see design.md §5.2 for exact scope)
+}
