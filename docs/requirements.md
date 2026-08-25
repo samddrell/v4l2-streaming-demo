@@ -77,8 +77,7 @@ network-quality degradation handling is in scope.
   message** (not free-text) — see 3.4 for required fields.
 - Instrumentation collected by the telemetry object, accumulated as running statistics over the
   **full duration of the run** (since the telemetry service thread started — not a sliding/fixed
-  window), using an online algorithm (e.g. running min/max, Welford's method for mean) so memory
-  use doesn't grow with run length:
+  window):
   - Queue depth (current, plus running min/max/mean).
   - Time-in-queue per message (running min/max/mean).
 
@@ -103,7 +102,6 @@ The image protobuf message (published on socket 1) must include, at minimum:
 - The image payload (pixel data + format/width/height metadata sufficient for the GUI to decode
   without out-of-band configuration).
 - A capture timestamp, to allow the GUI (or a later analysis step) to compute end-to-end latency.
-- A frame sequence number, to detect drops.
 
 ### 3.5 Python GUI (Windows)
 

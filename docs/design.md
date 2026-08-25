@@ -5,40 +5,38 @@
 
 ## 1. Component / Process Map
 
-```
-Jetson Orin Nano (Linux, aarch64, JetPack 6 / L4T R36.4.3)
-┌───────────────────────────────────────────────────────────────────┐
-│ producer (single process, 2 threads)                               │
-│                                                                      │
-│  [main thread]                          [telemetry thread]         │
-│  SyntheticV4L2Camera::readFrame()             │                    │
-│         │ (1) fill FrameBuffer                │                    │
-│         ▼                                      │                    │
-│  build ImageFrame protobuf                     │                    │
-│         │ (2) copy pixels into PB bytes field  │                    │
-│         ▼                                      │                    │
-│  Telemetry::enqueue(ImageFrame)  ───────►  FrameQueue (bounded,     │
-│         │                                  drop-oldest, mutex+cv)   │
-│         │                                       │                   │
-│         │                                       ▼                   │
-│         │                              dequeue → serialize (3)      │
-│         │                                       │                   │
-│         │                                       ▼                   │
-│         │                              zmq_send() on image PUB (4)  │
-│         │                                       │                   │
-│         │                              update running stats,        │
-│         │                              build TelemetryStats PB,     │
-│         │                              zmq_send() on stats PUB      │
-└───────────────────────────────────────────────────────────────────┘
-                          │ tcp://<jetson-ip>:5555 (images)
-                          │ tcp://<jetson-ip>:5556 (telemetry)
-                          ▼
-Windows laptop (same Wi-Fi LAN)
-┌───────────────────────────────────────────────────────────────────┐
-│ gui.py (PyQt6, single process)                                     │
-│  SUB socket (CONFLATE=1) ──► decode ImageFrame ──► QImage ──► paint │
-│  SUB socket (telemetry)  ──► decode TelemetryStats ──► labels/plot  │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Jetson["Jetson Orin Nano (Linux, aarch64, JetPack 6 / L4T R36.4.3)"]
+        subgraph Main["main thread"]
+            A["SyntheticV4L2Camera::readFrame()<br/>(0: fills FrameBuffer in place, no copy)"]
+            B["build ImageFrame protobuf<br/>(copy 1: FrameBuffer → pixel_data)"]
+            C["Telemetry::enqueue(ImageFrame)"]
+            A --> B --> C
+        end
+        subgraph Queue["FrameQueue (bounded, drop-oldest, mutex + cv)"]
+            Q[("owns queue_depth_stats_,<br/>snapshotted under its own mutex")]
+        end
+        subgraph Telem["telemetry service thread"]
+            D["dequeue<br/>(record time-in-queue)"]
+            E["serialize<br/>(copy 2: SerializeToArray)"]
+            F["zmq_send() on image PUB<br/>(copy 3: ZMQ's internal send buffer)"]
+            G["update time_in_queue_stats_ms_<br/>(this thread only, no lock needed)"]
+            H["build + send TelemetryStats on stats PUB"]
+            D --> E --> F
+            D --> G --> H
+        end
+        C --> Q
+        Q --> D
+    end
+
+    Jetson -- "tcp://&lt;jetson-ip&gt;:5555 (images)" --> GUI
+    Jetson -- "tcp://&lt;jetson-ip&gt;:5556 (telemetry)" --> GUI
+
+    subgraph GUI["Windows laptop (same Wi-Fi LAN) — gui.py, PyQt6, single process"]
+        I["SUB socket (CONFLATE=1)"] --> J["decode ImageFrame"] --> K["QImage"] --> L["paint"]
+        M["SUB socket (telemetry)"] --> N["decode TelemetryStats"] --> O["labels/plot"]
+    end
 ```
 
 Two threads on the producer, two independent ZMQ `PUB` sockets, one Python process on the GUI
@@ -76,12 +74,11 @@ enum PixelFormat {
 }
 
 message ImageFrame {
-  uint64 sequence_number = 1;       // monotonic, starts at 0, detects drops
-  int64  capture_time_unix_ns = 2;  // Jetson clock, time the frame was captured
-  uint32 width = 3;                 // 800
-  uint32 height = 4;                // 600
-  PixelFormat pixel_format = 5;     // PIXEL_FORMAT_YUY2
-  bytes pixel_data = 6;             // width*height*2 bytes for YUY2
+  int64  capture_time_unix_ns = 1;  // Jetson clock, time the frame was captured
+  uint32 width = 2;                 // 800
+  uint32 height = 3;                // 600
+  PixelFormat pixel_format = 4;     // PIXEL_FORMAT_YUY2
+  bytes pixel_data = 5;             // width*height*2 bytes for YUY2
 }
 
 message QueueStats {
@@ -160,13 +157,11 @@ camera.open();
 telemetry.start();
 
 FrameBuffer buf(800 * 600 * 2);
-uint64_t seq = 0;
 while (running) {
   auto t0 = steady_clock::now();
   int64_t capture_ns = camera.readFrame(buf);              // (1) camera fills buf in place
 
   auto pb_frame = std::make_unique<telemetry::ImageFrame>();
-  pb_frame->set_sequence_number(seq++);
   pb_frame->set_capture_time_unix_ns(capture_ns);
   pb_frame->set_width(800);
   pb_frame->set_height(600);
@@ -196,39 +191,46 @@ class Telemetry {
 
   // Bounded, thread-safe, drop-oldest queue: std::deque + std::mutex + std::condition_variable.
   // enqueue(): if size == capacity, pop_front() (drop oldest) before push_back().
+  // Owns queue_depth_stats_ internally and updates it under the same mutex used for push/pop,
+  // so there is exactly one lock guarding queue depth — no separate mutex is needed for it.
+  // getDepthStats() returns a snapshot taken under that same internal mutex.
   BoundedDropOldestQueue<std::unique_ptr<telemetry::ImageFrame>> queue_;
 
   zmq::context_t ctx_;
   zmq::socket_t image_pub_;   // PUB, bound at image_endpoint
   zmq::socket_t stats_pub_;   // PUB, bound at stats_endpoint
 
-  RunningStats queue_depth_stats_;      // min/max + Welford mean
-  RunningStats time_in_queue_stats_ms_; // min/max + Welford mean
+  // Written and read exclusively by the service thread (updated on dequeue, read when building
+  // TelemetryStats on the same thread) — no synchronization needed.
+  RunningStats time_in_queue_stats_ms_;
   std::atomic<double> last_frame_us_{0};
-  std::mutex rusage_stat_mutex_; // guards the two RunningStats objects (single writer thread + reader on publish, still needs guarding vs enqueue-side depth updates)
 };
 ```
 
-- **Enqueue path (called from main thread)**: lock queue mutex → if at capacity, pop-front
-  (drop oldest, requirements §6.6) → push-back the new frame with an enqueue timestamp attached
-  → update `queue_depth_stats_` → notify the service thread's condition variable → unlock.
+- **Enqueue path (called from main thread)**: lock `queue_`'s internal mutex → if at capacity,
+  pop-front (drop oldest, requirements §6.6) → push-back the new frame with an enqueue timestamp
+  attached → update the queue's own depth stats while still holding that same lock → notify the
+  service thread's condition variable → unlock. This is the only lock this path acquires; there
+  is no second, separately-locked stats object to keep in sync with it.
 - **Service thread**: waits on the condition variable, pops the front frame, computes
-  `time_in_queue = now - enqueue_timestamp`, updates `time_in_queue_stats_ms_`, serializes the
-  `ImageFrame` PB **(copy 3: protobuf `SerializeToArray` into a ZMQ message buffer)**, and calls
-  `image_pub_.send()` **(copy 4: ZMQ's own internal copy into its send buffer, since we are not
-  using zero-copy sends — requirements §6.5 explicitly excludes zero-copy)**. After every image
-  send, it also rebuilds and publishes `TelemetryStats` on `stats_pub_` at the same cadence
-  (requirements §6.15 — one stats message per image frame).
-- **Memory-copy count (`memory_copies_per_frame` field)**: for this design, exactly **4** copies
+  `time_in_queue = now - enqueue_timestamp`, updates `time_in_queue_stats_ms_` (safe without a
+  lock, since this field is written and read only by this thread), serializes the `ImageFrame`
+  PB **(copy 2: protobuf `SerializeToArray` into a contiguous buffer)**, and calls
+  `image_pub_.send()` **(copy 3: ZMQ's own internal copy into its send buffer, since we are not
+  using zero-copy sends — requirements §6.5 explicitly excludes zero-copy)**. To include queue
+  depth stats in the stats message, it calls `queue_.getDepthStats()`, which briefly takes the
+  queue's mutex to snapshot the values — the only cross-thread synchronization this class
+  performs. After every image send, it also rebuilds and publishes `TelemetryStats` on
+  `stats_pub_` at the same cadence (requirements §6.15 — one stats message per image frame).
+- **Memory-copy count (`memory_copies_per_frame` field)**: for this design, exactly **3** copies
   per frame in the steady-state path:
-  1. Camera renders directly into the reusable `FrameBuffer` (not a copy — this is the origin,
-     counted as 0).
-  2. `FrameBuffer` bytes → `ImageFrame.pixel_data` (protobuf `set_pixel_data` copies into the
-     message's internal `std::string`).
-  3. Protobuf `SerializeToArray`/`SerializeToString` → contiguous serialized buffer.
-  4. ZMQ `send()` copying the serialized buffer into its own internal message buffer (default,
+  1. `FrameBuffer` bytes → `ImageFrame.pixel_data` (protobuf `set_pixel_data` copies into the
+     message's internal `std::string`). The camera rendering directly into `FrameBuffer` is the
+     origin of the data — not a copy — and isn't counted.
+  2. Protobuf `SerializeToArray`/`SerializeToString` → contiguous serialized buffer.
+  3. ZMQ `send()` copying the serialized buffer into its own internal message buffer (default,
      non-zero-copy send).
-  This is a fixed constant, so `memory_copies_per_frame` is reported as a constant `4` rather
+  This is a fixed constant, so `memory_copies_per_frame` is reported as a constant `3` rather
   than computed at runtime — its value is documented here and re-verified by the test plan
   (e.g. via a build with copy-counting instrumentation/ASan or manual code audit) rather than
   measured via runtime instrumentation, since counting actual `memcpy` calls at runtime would
@@ -275,15 +277,16 @@ class Telemetry {
   receipt, per requirements §6.11 — computed from the metadata field, never from OCR/pixel
   inspection. Clocks assumed synchronized (documented limitation, requirements §6.11).
 - **Telemetry panel**: labels (or a small rolling `pyqtgraph`/`matplotlib` widget, optional
-  polish) for queue depth min/max/mean, time-in-queue min/max/mean, copies/frame, CPU%, RSS,
-  producer µs/frame, and the just-computed cross-machine latency.
+  polish) for queue depth min/max/mean, time-in-queue min/max/mean, copies/frame,
+  CPU time (user/system, cumulative), RSS, producer µs/frame, and the just-computed
+  cross-machine latency.
 
 ## 7. Sequence: One Frame, End to End
 
 1. `SyntheticV4L2Camera::readFrame` blocks until the next 33.3ms tick, fills the `FrameBuffer`
    in place, returns `capture_ns`.
 2. Main thread builds `ImageFrame` PB, copying `FrameBuffer` into `pixel_data` (copy 1 of the
-   pipeline's 4).
+   pipeline's 3).
 3. Main thread moves the `ImageFrame` into the telemetry object's `enqueue()`; if the queue is
    at its 30-frame cap, the oldest queued frame is dropped first.
 4. Telemetry service thread wakes, pops the frame, records time-in-queue, serializes it
@@ -333,6 +336,10 @@ neither generated output is checked in, to keep the `.proto` as the single sourc
 - `memory_copies_per_frame` is a documented constant derived from code inspection, not a
   runtime-measured count.
 - No security/auth on ZMQ sockets; no reconnect/discovery logic beyond a manually-supplied IP.
+- ZMQ `PUB`/`SUB` has no message replay for a subscriber that connects after publishing has
+  started (the "slow-joiner" problem) — a GUI that connects mid-run will not see frames
+  published before it finished connecting. This is intentional, not a gap: the GUI is meant to
+  show only the current live stream, never a backlog, so no buffering/replay is implemented.
 - Phase 2 (real V4L2 kernel driver) is out of scope for this design; `SyntheticV4L2Camera`'s
   interface is written narrow enough (`open`/`readFrame`/`close`) that a future
   `RealV4L2Camera` could implement the same shape without changing `main.cpp`.
