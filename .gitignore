@@ -1,1 +1,10 @@
 producer/build/
+
+# GUI (Python)
+gui/telemetry_pb2.py
+gui/telemetry_pb2.pyi
+__pycache__/
+*.pyc
+gui/.venv/
+.venv/
+.pytest_cache/
