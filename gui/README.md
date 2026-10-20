@@ -44,6 +44,9 @@ here once this has been run for real:
 python gui.py --host <jetson-ip>
 ```
 
+For a producer running in WSL2 on this same laptop, use `--host 127.0.0.1`
+(see [../producer/README.md](../producer/README.md)).
+
 `--image-port` (default 5555) and `--stats-port` (default 5556) override the
 fixed defaults if needed (design.md §5.3).
 

@@ -1,0 +1,2 @@
+# Shell scripts run under Linux/WSL; CRLF line endings break the shebang.
+*.sh text eol=lf

@@ -1,5 +1,5 @@
 PyQt6>=6.6
 pyzmq>=25.0
-protobuf>=4.21
+protobuf>=5.28.3
 numpy>=1.24
 pytest>=7.4

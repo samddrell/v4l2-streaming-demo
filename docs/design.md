@@ -47,6 +47,7 @@ side with a Qt event loop driven by a background receive thread (details in §6)
 | Component | Choice | Notes |
 |---|---|---|
 | Jetson OS | JetPack 6 / L4T R36.4.3, Ubuntu 22.04, aarch64 | native build on-device, no cross-compile |
+| WSL OS (alternate producer target) | Ubuntu 22.04.5 LTS under WSL2, x86_64 | native build, same apt packages and CMake as the Jetson; GUI connects via `127.0.0.1` (§5.3) |
 | C++ standard | C++17 | sufficient for the class design below; avoids C++20 toolchain risk on JetPack's default GCC |
 | Build system | CMake ≥ 3.16 | Ubuntu 22.04's packaged CMake is new enough |
 | Protobuf | `libprotobuf-dev` / `protobuf-compiler` from apt (protobuf 3.x as shipped by Ubuntu 22.04) | pin exact version in `README` once installed; avoid building protobuf from source unless the apt version proves incompatible |
@@ -263,6 +264,9 @@ class Telemetry {
   (requirements §6.4).
 - GUI takes the Jetson's current IP as a required CLI argument (`gui.py --host 192.168.x.x`);
   ports are the fixed defaults above, overridable by flag for flexibility during testing.
+- When the producer runs in WSL2 on the same laptop, the GUI is pointed at `--host 127.0.0.1`
+  (WSL2 NAT localhost forwarding). Fallback: `networkingMode=mirrored` in `.wslconfig`. See
+  `producer/README.md`.
 - No `.proto`-adjacent config file is introduced for phase 1 — a CLI flag is simpler and
   sufficient given there's exactly one producer and one GUI.
 
@@ -349,6 +353,9 @@ Test suites for both sides are covered in [test-plan.md](test-plan.md).
 
 - Latency numbers assume synchronized clocks between Jetson and Windows laptop; no calibration
   is implemented.
+- With the producer in WSL2 on the same laptop, latency is measured over Windows↔WSL loopback
+  and is not comparable to Jetson-over-Wi-Fi figures. The clocks share a host time source, but
+  WSL's clock can drift after Windows sleep/hibernate.
 - `memory_copies_per_frame` is a documented constant derived from code inspection, not a
   runtime-measured count.
 - Unlike `SyntheticV4L2Camera` (which never allocates per frame, §4), `main.cpp`'s capture loop
